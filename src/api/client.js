@@ -38,8 +38,8 @@ if (typeof window !== "undefined") {
   });
 }
 
-export async function getValidToken() {
-  if (cachedToken && Date.now() < tokenExpiresAt - 30000) {
+export async function getValidToken(force = false) {
+  if (!force && cachedToken && Date.now() < tokenExpiresAt - 30000) {
     return cachedToken;
   }
   try {

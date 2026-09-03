@@ -4,15 +4,20 @@ import { api, API_URL, getValidToken } from "./client";
  * Fetch a challenge asset through the authenticated API. The backend masks
  * asset URLs as `/api/challenges/assets/masked?...`, which requires the auth
  * header that a plain <img>/<video>/<a> tag cannot send.
+ * On 401, retries once with a freshly-refreshed Supabase token (the round
+ * clock / poll loop can outlive the cached access token).
  */
-export async function fetchMaskedAssetFile(maskedPath) {
-  const token = await getValidToken();
+export async function fetchMaskedAssetFile(maskedPath, retries = 1) {
+  const token = await getValidToken(retries < 1 ? true : false);
   const headers = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(`${API_URL}${maskedPath}`, {
     headers,
     credentials: "include",
   });
+  if (res.status === 401 && retries > 0) {
+    return fetchMaskedAssetFile(maskedPath, retries - 1);
+  }
   if (!res.ok) {
     throw new Error(`Failed to fetch asset [HTTP ${res.status}]`);
   }

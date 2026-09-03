@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useGameState } from '../../context/GameStateContext';
-import { isMaskedAssetUrl } from '../../api/challenges';
+import { isMaskedAssetUrl, fetchMaskedAssetFile } from '../../api/challenges';
 import { API_URL } from '../../api/client';
 import {
   Copy,
@@ -41,29 +41,93 @@ export default function ResourceViewer() {
   const [assetSrc, setAssetSrc] = useState(null);
   const [assetLoading, setAssetLoading] = useState(false);
   const [assetError, setAssetError] = useState(false);
+  const [retryTick, setRetryTick] = useState(0);
+  // Tracks the currently-loaded masked asset (stripped of the 15-min ?t=
+  // token) so the 10s poll loop doesn't reload/restart it on every tick.
+  const assetRef = useRef(null);
 
   useEffect(() => {
     setActiveAssetIdx(0);
   }, [currentRound, currentPhase]);
 
   useEffect(() => {
-    setAssetSrc(null);
-    setAssetError(false);
+    if (!phaseData) { setAssetSrc(null); setAssetError(false); setAssetLoading(false); return undefined; }
 
-    if (!phaseData) return undefined;
     const assetsList = phaseData.assets || [];
     const safeIdx = Math.min(activeAssetIdx, Math.max(0, assetsList.length - 1));
     const url = (assetsList[safeIdx]?.url || phaseData.resourceUrl || '').trim();
-    if (!url || url === '#') return undefined;
+    if (!url || url === '#') { setAssetSrc(null); setAssetError(false); setAssetLoading(false); return undefined; }
 
     if (!isMaskedAssetUrl(url)) {
       setAssetSrc(url);
+      setAssetError(false);
+      setAssetLoading(false);
       return undefined;
     }
 
-    setAssetSrc(`${API_URL}${url}`);
-    return undefined;
-  }, [phaseData?.assets, phaseData?.resourceUrl, activeAssetIdx, currentRound, currentPhase]);
+    // Stable identity of the asset: the signed URL differs by ?t= token on
+    // every poll, so compare (and dedupe) on the masked path minus token.
+    const base = url.replace(/[?&]t=[^&]*/g, '');
+    const now = Date.now();
+    const stored = assetRef.current;
+    if (stored && stored.base === base) {
+      // Already showing this asset. Only force a reload if the media token
+      // has been refreshed recently (player needs a fresh one), and for
+      // blobs keep the object URL as-is.
+      const needsTokenRefresh = stored.isStreamable && now - stored.ts > 14 * 60 * 1000;
+      if (!needsTokenRefresh) {
+        setAssetLoading(false);
+        return undefined;
+      }
+    }
+
+    // Streamable media (audio/video) is hot-linked straight from the signed
+    // masked URL so the player can range-request instead of waiting for a
+    // full blob download. The ?t= media token lets <audio>/<video> load it
+    // cross-site without cookies. Fall back to the Bearer blob path when the
+    // server is not signing tokens yet (MEDIA_SIGNING_SECRET unset).
+    const rawType = String(assetsList[safeIdx]?.type || phaseData.resourceType || '').toLowerCase();
+    const isStreamable =
+      rawType.includes('audio') || rawType.includes('video') ||
+      EXT_PATTERNS.audio.test(url) || EXT_PATTERNS.video.test(url) ||
+      EXT_PATTERNS.audio.test(assetsList[safeIdx]?.name || '') || EXT_PATTERNS.video.test(assetsList[safeIdx]?.name || '');
+    const mediaToken = /[?&]t=/.test(url);
+
+    if (isStreamable && mediaToken) {
+      assetRef.current = { base, ts: now, isStreamable: true };
+      setAssetSrc(`${API_URL}${url}`);
+      setAssetError(false);
+      setAssetLoading(false);
+      return undefined;
+    }
+
+    // Masked non-media paths (image/pdf/files) can't be loaded by <img>/<a>
+    // alone: those elements can't send the Authorization header, and the ?t=
+    // media token / session cookie alternatives are unreliable (token TTL is
+    // 15 min, session TTL 30 min and in-memory). Fetch the blob with the
+    // Bearer header and render a local object URL instead.
+    setAssetSrc(null);
+    setAssetError(false);
+    setAssetLoading(true);
+    let objectUrl = null;
+    fetchMaskedAssetFile(url)
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        assetRef.current = { base, ts: now, isStreamable: false };
+        setAssetSrc(objectUrl);
+        setAssetLoading(false);
+      })
+      .catch(() => {
+        assetRef.current = null;
+        setAssetError(true);
+        setAssetLoading(false);
+      });
+
+    return () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      setAssetLoading(false);
+    };
+  }, [phaseData, phaseData?.assets, phaseData?.resourceUrl, phaseData?.resourceType, activeAssetIdx, currentRound, currentPhase, retryTick]);
 
   const handleCopy = (text) => {
     if (!text) return;
@@ -236,7 +300,16 @@ export default function ResourceViewer() {
         )}
         {assetError && (
           <div className="flex flex-1 items-center justify-center py-10">
-            <p className="font-orbitron text-[10px] tracking-[0.24em] text-red-300">UPLINK BLOCKED — ASSET COULD NOT BE RETRIEVED</p>
+            <div className="flex flex-col items-center gap-3">
+              <p className="font-orbitron text-[10px] tracking-[0.24em] text-red-300">UPLINK BLOCKED — ASSET COULD NOT BE RETRIEVED</p>
+              <button
+                type="button"
+                onClick={() => { setAssetError(false); setRetryTick(t => t + 1); }}
+                className="inline-flex items-center gap-1 rounded bg-accretion/15 border border-accretion/30 px-2.5 py-1 font-mono text-[9px] text-accretion transition-all hover:bg-accretion hover:text-black active:scale-95"
+              >
+                RETRY
+              </button>
+            </div>
           </div>
         )}
         {!assetLoading && !assetError && resourceType === 'image' && (
@@ -389,6 +462,7 @@ export default function ResourceViewer() {
                 href={displayUrl}
                 target="_blank"
                 rel="noopener noreferrer"
+                download={resourceType === 'pdf' || resourceType === 'file' ? assetName || undefined : undefined}
                 className="inline-flex min-h-[40px] items-center gap-2 rounded border border-accretion bg-accretion/20 px-4 py-2 font-orbitron text-xs tracking-wider uppercase text-accretion transition-all hover:bg-accretion hover:text-black active:scale-95 shadow-[0_0_12px_rgba(209,155,131,0.25)]"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
